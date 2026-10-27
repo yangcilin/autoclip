@@ -4,10 +4,12 @@
 
 import logging
 import os
+import time
 from typing import Dict, Any, Optional, Callable
 from pathlib import Path
 
 from backend.services.simple_progress import emit_progress, clear_progress
+from backend.core.job_budget import JobDurationExceeded
 from backend.core.project_cancellation import ProjectDeleted
 from backend.pipeline.failures import (
     PipelineFailure, HINT_LOWER_THRESHOLD, HINT_CHECK_FFMPEG, http_status_of,
@@ -91,14 +93,70 @@ class TranscriptionProgress:
 
     @classmethod
     def finish_studio(cls, project_id: str) -> None:
+        """Leave the production message, and keep a project-scale percent.
+
+        The audio share (0–100) must not stay on screen as 100% while the rest
+        of the run continues, and it must not disappear. The number is the
+        SUBTITLE band (simple_progress), or whatever the project bar already
+        reached if that is further along.
+        """
+        from backend.services.simple_progress import compute_percent
+
         def restore(analysis):
-            if analysis.get('message') == STUDIO_TRANSCRIBING_MESSAGE:
-                analysis['message'] = STUDIO_PRODUCTION_MESSAGE
-                analysis.pop('percent', None)
+            if analysis.get('message') != STUDIO_TRANSCRIBING_MESSAGE:
+                return
+            analysis['message'] = STUDIO_PRODUCTION_MESSAGE
+            percent = compute_percent('SUBTITLE', TRANSCRIBE_DONE_SUBPERCENT)
+            previous = analysis.get('progress_percent')
+            if isinstance(previous, (int, float)):
+                percent = max(percent, int(previous))
+            analysis['percent'] = percent
+            analysis['progress_percent'] = percent
+            analysis['progress_stage'] = analysis.get('progress_stage') or 'SUBTITLE'
+            analysis['progress_approximate'] = False
         try:
             cls.studio_update(project_id, restore)
         except FileNotFoundError:
             pass
+
+
+def mirror_studio_progress(project_id: str, stage: str, percent: int, message: str, *, approximate: bool) -> None:
+    """Mirror one simple_progress snapshot into a running Studio production.
+
+    Download and transcription keep their own measured `percent` (bytes / audio).
+    The project bar lives in `progress_percent`. After transcription, `percent`
+    follows the project bar so the results page never goes blank.
+    DONE is not mirrored: the content pipeline finishes before Studio renders,
+    and 100% is reserved for a run that has actually finished.
+    """
+    if not project_id or stage == 'DONE':
+        return
+    shown = max(0, min(99, int(percent)))
+
+    def update(analysis):
+        previous = analysis.get('progress_percent')
+        if isinstance(previous, (int, float)) and shown < int(previous):
+            kept = int(previous)
+        else:
+            kept = shown
+        if (
+            analysis.get('progress_percent') == kept
+            and analysis.get('progress_stage') == stage
+            and analysis.get('progress_message') == message
+            and analysis.get('progress_approximate') is approximate
+            and (analysis.get('message') == STUDIO_TRANSCRIBING_MESSAGE or analysis.get('percent') == kept)
+        ):
+            return
+        if analysis.get('progress_stage') != stage or not isinstance(analysis.get('progress_since'), int):
+            analysis['progress_since'] = int(time.time())
+        analysis['progress_percent'] = kept
+        analysis['progress_stage'] = stage
+        analysis['progress_message'] = message
+        analysis['progress_approximate'] = approximate
+        if analysis.get('message') != STUDIO_TRANSCRIBING_MESSAGE:
+            analysis['percent'] = kept
+
+    TranscriptionProgress.studio_update(project_id, update)
 
 class SimplePipelineAdapter:
     """简化的流水线适配器，使用固定阶段进度系统"""
@@ -219,7 +277,7 @@ class SimplePipelineAdapter:
             f"没有可用的 LLM 提供商（当前选择：{name} · {model}），缺少 API Key 或本地服务地址。",
         )
 
-    def _find_clips_in_one_pass(self, srt_path: Path, metadata_dir: Path):
+    def _find_clips_in_one_pass(self, srt_path: Path, metadata_dir: Path, platform_min_sec=None, platform_min_label=''):
         """Titled clips from one model pass over the whole transcript, or None to use the legacy steps."""
         from backend.pipeline.clip_finder import find_clips
         from backend.pipeline.step3_scoring import resolve_min_score_threshold
@@ -230,14 +288,16 @@ class SimplePipelineAdapter:
         try:
             entries = TextProcessor.parse_srt(Path(srt_path))
             with llm_usage.timed("clip_finder"):
-                return find_clips(entries, text_json, threshold=resolve_min_score_threshold(), metadata_dir=metadata_dir)
+                return find_clips(entries, text_json, threshold=resolve_min_score_threshold(), metadata_dir=metadata_dir,
+                                  platform_min_sec=platform_min_sec, platform_min_label=platform_min_label)
         except ProjectDeleted:
             raise
         except Exception as error:  # noqa: BLE001 - the legacy steps still work with any model
             logger.warning("一次挑片不可用，改用分步分析: %s", error)
             return None
 
-    async def process_project_sync(self, input_video_path: str, input_srt_path: str, clips_only: bool = False) -> Dict[str, Any]:
+    async def process_project_sync(self, input_video_path: str, input_srt_path: str, clips_only: bool = False,
+                                   platform_min_sec: float | None = None, platform_min_label: str = '') -> Dict[str, Any]:
         """
         同步处理项目 - 使用简化的进度系统
         
@@ -275,17 +335,19 @@ class SimplePipelineAdapter:
             checkpoint(self.project_id)
             emit_progress(self.project_id, "INGEST", "素材准备完成")
             # 源视频比最短片段还短、或没有音轨又没带字幕：字幕路线注定失败，先拦下，不调用任何模型（RC156 #10/#11）
-            from backend.pipeline import media_precheck
-            blocked = media_precheck.subtitle_route_failure(
-                input_video_path, srt_available=bool(input_srt_path and Path(input_srt_path).exists()))
-            if blocked:
-                raise blocked
-            from backend.pipeline.concurrency import reset_limiter
-            reset_limiter()
-            srt_available = bool(input_srt_path and Path(input_srt_path).exists())
-            if not srt_available:
+            # The one preflight (#418 rewrite), before any paid call, SRT attached or not: the source is decided
+            # first (unreadable / under 1 s / too short / no audio without SRT), then transcription.
+            from backend.services.studio import preflight
+            checked = preflight.preflight(preflight.ResolvedInputs(
+                Path(input_video_path), Path(input_srt_path) if input_srt_path else None, entry='content'))
+            if checked.source_failure is not None:
+                raise checked.source_failure
+            if not checked.ok:
                 from backend.services.studio import readiness
                 readiness.require_transcription(stage="SUBTITLE", srt_available=False)
+                raise checked.asr_failure or PipelineFailure("SUBTITLE", "转写不可用", code="asr_not_ready")
+            from backend.pipeline.concurrency import reset_limiter
+            reset_limiter()
             self._preflight_llm()
             checkpoint(self.project_id)
 
@@ -303,7 +365,7 @@ class SimplePipelineAdapter:
                     with llm_usage.timed("transcribe"):
                         srt_path = await self._generate_subtitle_automatically(input_video_path, metadata_dir)
                 except CloudTranscriptionError as e:
-                    raise cloud_transcription_failure(str(e)) from e
+                    raise cloud_transcription_failure(e) from e
                 except SpeechRecognitionError as e:
                     raise failure_from_speech_error(str(e)) from e
                 if not (srt_path and srt_path.exists()):
@@ -313,7 +375,8 @@ class SimplePipelineAdapter:
 
             # 快速出片：一次挑片（整段字幕一次给模型）；不可用时回退旧的四步
             checkpoint(self.project_id)
-            titled_clips = self._find_clips_in_one_pass(srt_path, metadata_dir) if clips_only else None
+            titled_clips = self._find_clips_in_one_pass(
+                srt_path, metadata_dir, platform_min_sec, platform_min_label) if clips_only else None
             if titled_clips is not None:
                 outlines, timeline_data, scored_clips = [], [], titled_clips
                 emit_progress(self.project_id, "HIGHLIGHT", "片段挑选完成", subpercent=40)
@@ -445,6 +508,20 @@ class SimplePipelineAdapter:
             
         except ProjectDeleted:
             raise  # 项目已删除：停下，不写失败进度（RC156 #12）
+        except JobDurationExceeded as error:
+            # The wall-clock cap is a timeout the user can retry. The sentence is ours.
+            message = str(error)
+            failed = {
+                "status": "failed",
+                "project_id": self.project_id,
+                "task_id": self.task_id,
+                "stage": "ANALYZE",
+                "error": message,
+                "message": message,
+                "error_code": "timeout",
+            }
+            _carry_attribution(failed, error)
+            return failed
         except PipelineFailure as e:
             # 明确失败：带阶段和下一步提示，前端失败态 / 应用内反馈直接展示
             error_msg = e.user_message()
@@ -465,6 +542,12 @@ class SimplePipelineAdapter:
             status = http_status_of(e)
             if status is not None:
                 failed["http_status"] = status
+            # the chain still exists HERE; the one snapshot is built now and travels in the dict
+            # whole (run_content restores it, the store writes it as is; nothing downstream re-judges).
+            _carry_attribution(failed, e)
+            upstream = getattr(e, "upstream_error_type", "") or (failed.get("attribution") or {}).get("upstream_error_type")
+            if upstream:
+                failed["upstream_error_type"] = upstream
             return failed
         except Exception as e:
             error_msg = f"流水线处理失败: {str(e)}"
@@ -483,7 +566,17 @@ class SimplePipelineAdapter:
             status = http_status_of(e)
             if status is not None:
                 failed["http_status"] = status
+            # the chain still exists HERE; the one snapshot is built now and travels in the dict
+            # whole (run_content restores it, the store writes it as is; nothing downstream re-judges).
+            _carry_attribution(failed, e)
             return failed
+
+
+def _carry_attribution(failed: dict, error: BaseException) -> None:
+    from backend.core.llm_emit import attribution_snapshot
+    snap = attribution_snapshot(error)
+    if snap is not None:
+        failed["attribution"] = snap.to_fields()
 
 
 def create_simple_pipeline_adapter(project_id: str, task_id: str) -> SimplePipelineAdapter:

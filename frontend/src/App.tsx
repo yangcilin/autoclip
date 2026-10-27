@@ -9,6 +9,9 @@ import PublishWeekPage from './pages/PublishWeekPage'
 import ImportReview from './features/studio/ImportReview'
 import StudioEditor from './features/studio/StudioEditor'
 import SettingsPage from './pages/SettingsPage'
+import SettingsReturnListener from './features/studio/SettingsReturnListener'
+import KeyGuidePrompt from './features/settings/KeyGuidePrompt'
+import { startKeyGuideWatch } from './features/settings/keyGuideWatch'
 import Header from './components/Header'
 import { UpdateProvider } from './desktop/UpdatePrompt'
 import { trackPageview } from './analytics/posthog'
@@ -28,11 +31,14 @@ function App() {
   console.log('🎬 App组件已加载');
   usePageviewTracking()
   useEffect(() => startWorkflowObserver(), [])
+  useEffect(() => startKeyGuideWatch(), [])
 
   return (
     <UpdateProvider>
       <Layout>
         <Header />
+        <SettingsReturnListener />
+        <KeyGuidePrompt />
         <Content>
           <Routes>
             <Route path="/" element={<HomePage />} />
